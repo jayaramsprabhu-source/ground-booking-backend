@@ -448,7 +448,7 @@ app.get('/api/tournaments/:id/matches', async (req, res) => {
       LEFT JOIN teams tb ON m.team_b_id = tb.id
       LEFT JOIN teams tw ON m.winner_team_id = tw.id
       WHERE m.tournament_id = $1
-      ORDER BY m.match_date ASC
+      ORDER BY m.match_date ASC, m.start_time ASC
     `, [req.params.id]);
     res.json(result.rows);
   } catch (err) {
@@ -465,16 +465,16 @@ app.post('/api/tournaments/:id/matches/bulk', async (req, res) => {
   const created = [];
   const errors = [];
   for (let i = 0; i < matches.length; i++) {
-    const { team_a_id, team_b_id, match_date, stage } = matches[i];
+    const { team_a_id, team_b_id, match_date, start_time, end_time, stage } = matches[i];
     if (!team_a_id || !team_b_id) {
       errors.push({ row: i + 1, error: 'Missing team A or team B' });
       continue;
     }
     try {
       const result = await pool.query(
-        `INSERT INTO matches (tournament_id, team_a_id, team_b_id, match_date, stage, outcome)
-         VALUES ($1, $2, $3, $4, $5, 'Not Played') RETURNING *`,
-        [req.params.id, team_a_id, team_b_id, match_date || null, stage || 'League']
+        `INSERT INTO matches (tournament_id, team_a_id, team_b_id, match_date, start_time, end_time, stage, outcome)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'Not Played') RETURNING *`,
+        [req.params.id, team_a_id, team_b_id, match_date || null, start_time || null, end_time || null, stage || 'League']
       );
       created.push(result.rows[0]);
     } catch (err) {
@@ -485,12 +485,45 @@ app.post('/api/tournaments/:id/matches/bulk', async (req, res) => {
 });
 
 app.post('/api/tournaments/:id/matches', async (req, res) => {
-  const { team_a_id, team_b_id, match_date, stage } = req.body;
+  const { team_a_id, team_b_id, match_date, start_time, end_time, stage } = req.body;
   try {
+    if (match_date && start_time && end_time) {
+      const bookingConflict = await pool.query(
+        `SELECT b.*, t.name AS team_name FROM bookings b
+         LEFT JOIN teams t ON b.team_id = t.id
+         WHERE b.date = $1 AND b.status != 'Cancelled'
+         AND b.start_time < $3 AND b.end_time > $2`,
+        [match_date, start_time, end_time]
+      );
+      if (bookingConflict.rows.length > 0) {
+        return res.status(409).json({
+          error: 'This time overlaps with an existing ground booking',
+          existing: bookingConflict.rows[0],
+          conflictType: 'booking'
+        });
+      }
+
+      const matchConflict = await pool.query(
+        `SELECT m.*, ta.name AS team_a_name, tb.name AS team_b_name FROM matches m
+         LEFT JOIN teams ta ON m.team_a_id = ta.id
+         LEFT JOIN teams tb ON m.team_b_id = tb.id
+         WHERE m.match_date = $1
+         AND m.start_time < $3 AND m.end_time > $2`,
+        [match_date, start_time, end_time]
+      );
+      if (matchConflict.rows.length > 0) {
+        return res.status(409).json({
+          error: 'This time overlaps with another fixture',
+          existing: matchConflict.rows[0],
+          conflictType: 'fixture'
+        });
+      }
+    }
+
     const result = await pool.query(
-      `INSERT INTO matches (tournament_id, team_a_id, team_b_id, match_date, stage, outcome)
-       VALUES ($1, $2, $3, $4, $5, 'Not Played') RETURNING *`,
-      [req.params.id, team_a_id, team_b_id, match_date, stage || 'League']
+      `INSERT INTO matches (tournament_id, team_a_id, team_b_id, match_date, start_time, end_time, stage, outcome)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'Not Played') RETURNING *`,
+      [req.params.id, team_a_id, team_b_id, match_date || null, start_time || null, end_time || null, stage || 'League']
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -500,12 +533,45 @@ app.post('/api/tournaments/:id/matches', async (req, res) => {
 });
 
 app.put('/api/matches/:id', async (req, res) => {
-  const { team_a_id, team_b_id, match_date, stage, result: resultText, outcome, winner_team_id } = req.body;
+  const { team_a_id, team_b_id, match_date, start_time, end_time, stage, result: resultText, outcome, winner_team_id } = req.body;
   try {
+    if (match_date && start_time && end_time) {
+      const bookingConflict = await pool.query(
+        `SELECT b.*, t.name AS team_name FROM bookings b
+         LEFT JOIN teams t ON b.team_id = t.id
+         WHERE b.date = $1 AND b.status != 'Cancelled'
+         AND b.start_time < $3 AND b.end_time > $2`,
+        [match_date, start_time, end_time]
+      );
+      if (bookingConflict.rows.length > 0) {
+        return res.status(409).json({
+          error: 'This time overlaps with an existing ground booking',
+          existing: bookingConflict.rows[0],
+          conflictType: 'booking'
+        });
+      }
+
+      const matchConflict = await pool.query(
+        `SELECT m.*, ta.name AS team_a_name, tb.name AS team_b_name FROM matches m
+         LEFT JOIN teams ta ON m.team_a_id = ta.id
+         LEFT JOIN teams tb ON m.team_b_id = tb.id
+         WHERE m.match_date = $1 AND m.id != $4
+         AND m.start_time < $3 AND m.end_time > $2`,
+        [match_date, start_time, end_time, req.params.id]
+      );
+      if (matchConflict.rows.length > 0) {
+        return res.status(409).json({
+          error: 'This time overlaps with another fixture',
+          existing: matchConflict.rows[0],
+          conflictType: 'fixture'
+        });
+      }
+    }
+
     const result = await pool.query(
-      `UPDATE matches SET team_a_id=$1, team_b_id=$2, match_date=$3, stage=$4, result=$5, outcome=$6, winner_team_id=$7
-       WHERE id=$8 RETURNING *`,
-      [team_a_id, team_b_id, match_date, stage, resultText, outcome, winner_team_id || null, req.params.id]
+      `UPDATE matches SET team_a_id=$1, team_b_id=$2, match_date=$3, start_time=$4, end_time=$5, stage=$6, result=$7, outcome=$8, winner_team_id=$9
+       WHERE id=$10 RETURNING *`,
+      [team_a_id, team_b_id, match_date, start_time, end_time, stage, resultText, outcome, winner_team_id || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Match not found' });
     res.json(result.rows[0]);
@@ -574,6 +640,166 @@ app.get('/api/tournaments/:id/standings', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to compute standings' });
+  }
+});
+
+// ===== UMPIRES =====
+
+app.get('/api/umpires', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM umpires ORDER BY name ASC');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch umpires' });
+  }
+});
+
+app.post('/api/umpires', async (req, res) => {
+  const { name, mobile, preferred_formats } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO umpires (name, mobile, preferred_formats) VALUES ($1, $2, $3) RETURNING *',
+      [name, mobile, preferred_formats]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to add umpire' });
+  }
+});
+
+app.put('/api/umpires/:id', async (req, res) => {
+  const { name, mobile, preferred_formats } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE umpires SET name=$1, mobile=$2, preferred_formats=$3 WHERE id=$4 RETURNING *',
+      [name, mobile, preferred_formats, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Umpire not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update umpire' });
+  }
+});
+
+app.delete('/api/umpires/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM umpires WHERE id=$1 RETURNING *', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Umpire not found' });
+    res.json({ message: 'Umpire deleted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete umpire' });
+  }
+});
+
+// ===== INVENTORY =====
+
+app.get('/api/inventory', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM inventory ORDER BY item_type ASC, name ASC');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch inventory' });
+  }
+});
+
+app.post('/api/inventory', async (req, res) => {
+  const { item_type, name, quantity, reorder_level, last_order_date } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO inventory (item_type, name, quantity, reorder_level, last_order_date)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [item_type, name, quantity || 0, reorder_level || 5, last_order_date || null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to add inventory item' });
+  }
+});
+
+app.put('/api/inventory/:id', async (req, res) => {
+  const { item_type, name, quantity, reorder_level, last_order_date } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE inventory SET item_type=$1, name=$2, quantity=$3, reorder_level=$4, last_order_date=$5
+       WHERE id=$6 RETURNING *`,
+      [item_type, name, quantity, reorder_level, last_order_date || null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update inventory item' });
+  }
+});
+
+app.delete('/api/inventory/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM inventory WHERE id=$1 RETURNING *', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    res.json({ message: 'Item deleted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete item' });
+  }
+});
+
+// ===== EXPENSES =====
+
+app.get('/api/expenses', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM expenses ORDER BY date DESC, created_at DESC');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch expenses' });
+  }
+});
+
+app.post('/api/expenses', async (req, res) => {
+  const { category, description, amount, date, paid_by_name } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO expenses (category, description, amount, date, paid_by_name)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [category, description, amount, date, paid_by_name]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to add expense' });
+  }
+});
+
+app.put('/api/expenses/:id', async (req, res) => {
+  const { category, description, amount, date, paid_by_name } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE expenses SET category=$1, description=$2, amount=$3, date=$4, paid_by_name=$5
+       WHERE id=$6 RETURNING *`,
+      [category, description, amount, date, paid_by_name, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Expense not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update expense' });
+  }
+});
+
+app.delete('/api/expenses/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM expenses WHERE id=$1 RETURNING *', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Expense not found' });
+    res.json({ message: 'Expense deleted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete expense' });
   }
 });
 
