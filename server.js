@@ -10,7 +10,6 @@ app.get('/', (req, res) => {
   res.send('Ground Booking API is running');
 });
 
-// Recalculate a booking's advance_paid, balance, and status from its payments
 async function recomputeBooking(bookingId) {
   const sumResult = await pool.query(
     'SELECT COALESCE(SUM(amount), 0) AS total_paid FROM payments WHERE booking_id = $1',
@@ -145,7 +144,6 @@ app.get('/api/bookings/:id', async (req, res) => {
   }
 });
 
-// ADD a new booking — always starts as Pending, no payment/status taken here
 app.post('/api/bookings', async (req, res) => {
   const { team_id, date, start_time, end_time, format, ground, total_fee, remarks } = req.body;
   const time_slot = `${start_time} - ${end_time}`;
@@ -210,7 +208,6 @@ app.put('/api/bookings/:id', async (req, res) => {
   }
 });
 
-// OVERRIDE — admin confirms a Pending booking without payment, note required
 app.put('/api/bookings/:id/override', async (req, res) => {
   const { note, by } = req.body;
   if (!note || !note.trim()) {
@@ -234,7 +231,6 @@ app.put('/api/bookings/:id/override', async (req, res) => {
   }
 });
 
-// CANCEL — admin cancels a Pending or Confirmed booking, frees the slot
 app.put('/api/bookings/:id/cancel', async (req, res) => {
   try {
     const result = await pool.query(
@@ -316,6 +312,268 @@ app.delete('/api/payments/:id', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to delete payment' });
+  }
+});
+
+// ===== TOURNAMENTS =====
+
+app.get('/api/tournaments', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT t.*,
+        (SELECT COUNT(*) FROM tournament_teams tt WHERE tt.tournament_id = t.id) AS registered_teams,
+        (SELECT COUNT(*) FROM matches m WHERE m.tournament_id = t.id) AS total_matches
+      FROM tournaments t
+      ORDER BY t.start_date DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch tournaments' });
+  }
+});
+
+app.get('/api/tournaments/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM tournaments WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch tournament' });
+  }
+});
+
+app.post('/api/tournaments', async (req, res) => {
+  const { name, total_teams, start_date, status, prize_money } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO tournaments (name, total_teams, start_date, status, prize_money)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [name, total_teams, start_date, status || 'Upcoming', prize_money]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to add tournament' });
+  }
+});
+
+app.put('/api/tournaments/:id', async (req, res) => {
+  const { name, total_teams, start_date, status, prize_money } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE tournaments SET name=$1, total_teams=$2, start_date=$3, status=$4, prize_money=$5
+       WHERE id=$6 RETURNING *`,
+      [name, total_teams, start_date, status, prize_money, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update tournament' });
+  }
+});
+
+app.delete('/api/tournaments/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM matches WHERE tournament_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM tournament_teams WHERE tournament_id = $1', [req.params.id]);
+    const result = await pool.query('DELETE FROM tournaments WHERE id=$1 RETURNING *', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    res.json({ message: 'Tournament deleted', tournament: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete tournament' });
+  }
+});
+
+app.get('/api/tournaments/:id/teams', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT tt.id AS registration_id, t.*
+      FROM tournament_teams tt
+      JOIN teams t ON tt.team_id = t.id
+      WHERE tt.tournament_id = $1
+      ORDER BY t.name ASC
+    `, [req.params.id]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch tournament teams' });
+  }
+});
+
+app.post('/api/tournaments/:id/teams', async (req, res) => {
+  const { team_id } = req.body;
+  try {
+    const existing = await pool.query(
+      'SELECT * FROM tournament_teams WHERE tournament_id = $1 AND team_id = $2',
+      [req.params.id, team_id]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Team already registered in this tournament' });
+    }
+    const result = await pool.query(
+      'INSERT INTO tournament_teams (tournament_id, team_id) VALUES ($1, $2) RETURNING *',
+      [req.params.id, team_id]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to register team' });
+  }
+});
+
+app.delete('/api/tournaments/:tournamentId/teams/:teamId', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM tournament_teams WHERE tournament_id = $1 AND team_id = $2 RETURNING *',
+      [req.params.tournamentId, req.params.teamId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Registration not found' });
+    res.json({ message: 'Team removed from tournament' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to remove team' });
+  }
+});
+
+app.get('/api/tournaments/:id/matches', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT m.*, ta.name AS team_a_name, tb.name AS team_b_name, tw.name AS winner_name
+      FROM matches m
+      LEFT JOIN teams ta ON m.team_a_id = ta.id
+      LEFT JOIN teams tb ON m.team_b_id = tb.id
+      LEFT JOIN teams tw ON m.winner_team_id = tw.id
+      WHERE m.tournament_id = $1
+      ORDER BY m.match_date ASC
+    `, [req.params.id]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch matches' });
+  }
+});
+
+app.post('/api/tournaments/:id/matches/bulk', async (req, res) => {
+  const { matches } = req.body;
+  if (!Array.isArray(matches) || matches.length === 0) {
+    return res.status(400).json({ error: 'No matches provided' });
+  }
+  const created = [];
+  const errors = [];
+  for (let i = 0; i < matches.length; i++) {
+    const { team_a_id, team_b_id, match_date, stage } = matches[i];
+    if (!team_a_id || !team_b_id) {
+      errors.push({ row: i + 1, error: 'Missing team A or team B' });
+      continue;
+    }
+    try {
+      const result = await pool.query(
+        `INSERT INTO matches (tournament_id, team_a_id, team_b_id, match_date, stage, outcome)
+         VALUES ($1, $2, $3, $4, $5, 'Not Played') RETURNING *`,
+        [req.params.id, team_a_id, team_b_id, match_date || null, stage || 'League']
+      );
+      created.push(result.rows[0]);
+    } catch (err) {
+      errors.push({ row: i + 1, error: 'Failed to insert' });
+    }
+  }
+  res.status(201).json({ created: created.length, errors });
+});
+
+app.post('/api/tournaments/:id/matches', async (req, res) => {
+  const { team_a_id, team_b_id, match_date, stage } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO matches (tournament_id, team_a_id, team_b_id, match_date, stage, outcome)
+       VALUES ($1, $2, $3, $4, $5, 'Not Played') RETURNING *`,
+      [req.params.id, team_a_id, team_b_id, match_date, stage || 'League']
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to add match' });
+  }
+});
+
+app.put('/api/matches/:id', async (req, res) => {
+  const { team_a_id, team_b_id, match_date, stage, result: resultText, outcome, winner_team_id } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE matches SET team_a_id=$1, team_b_id=$2, match_date=$3, stage=$4, result=$5, outcome=$6, winner_team_id=$7
+       WHERE id=$8 RETURNING *`,
+      [team_a_id, team_b_id, match_date, stage, resultText, outcome, winner_team_id || null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Match not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update match' });
+  }
+});
+
+app.delete('/api/matches/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM matches WHERE id=$1 RETURNING *', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Match not found' });
+    res.json({ message: 'Match deleted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete match' });
+  }
+});
+
+app.get('/api/tournaments/:id/standings', async (req, res) => {
+  try {
+    const teamsResult = await pool.query(`
+      SELECT t.id, t.name
+      FROM tournament_teams tt
+      JOIN teams t ON tt.team_id = t.id
+      WHERE tt.tournament_id = $1
+    `, [req.params.id]);
+
+    const matchesResult = await pool.query(
+      `SELECT * FROM matches WHERE tournament_id = $1 AND outcome != 'Not Played'`,
+      [req.params.id]
+    );
+
+    const standings = {};
+    teamsResult.rows.forEach((t) => {
+      standings[t.id] = {
+        team_id: t.id,
+        team_name: t.name,
+        played: 0, won: 0, lost: 0, tied: 0, points: 0
+      };
+    });
+
+    matchesResult.rows.forEach((m) => {
+      const a = standings[m.team_a_id];
+      const b = standings[m.team_b_id];
+      if (!a || !b) return;
+
+      a.played += 1;
+      b.played += 1;
+
+      if (m.outcome === 'Team A Won') {
+        a.won += 1; a.points += 2;
+        b.lost += 1;
+      } else if (m.outcome === 'Team B Won') {
+        b.won += 1; b.points += 2;
+        a.lost += 1;
+      } else if (m.outcome === 'Tie' || m.outcome === 'No Result') {
+        a.tied += 1; a.points += 1;
+        b.tied += 1; b.points += 1;
+      }
+    });
+
+    const table = Object.values(standings).sort((x, y) => y.points - x.points || y.won - x.won);
+    res.json(table);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to compute standings' });
   }
 });
 
